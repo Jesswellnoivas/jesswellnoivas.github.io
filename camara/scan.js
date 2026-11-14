@@ -3,7 +3,7 @@
  * Usado pela câmara (camara/index.html) e pela app da equipa (fotos da galeria e da câmara do telemóvel).
  *
  *  - qualidade: nitidez (variância do Laplaciano) e luz, só na zona do papel;
- *  - papel: deteção pelo contraste com o fundo (Otsu + maior mancha clara) e 4 cantos;
+ *  - papel: deteção das 4 bordas (linhas retas + contraste dentro/fora); alternativa: maior mancha clara;
  *  - endireitar: correção de perspetiva para um retângulo;
  *  - documento: tira sombras/fundo cinzento, reforça o texto (cinzento, pequeno aumento de nitidez);
  *  - tamanho: lado maior até 2000 px, JPEG 85 %;
@@ -11,7 +11,7 @@
  */
 (function () {
   'use strict';
-  var LADO = 2000, Q = 0.85, MINI = 96;
+  var LADO = 2000, Q = 0.85, MINI = 96, DEBUG = false;
   var LIMITE_NITIDEZ = 90;   // nitidez relativa ao contraste; abaixo: tremida/desfocada (calibrado: nítidas 230–760, tremidas < 75)
   var LIMITE_LUZ = 60;       // média de cinzento do papel abaixo disto: escura demais (o filtro recupera acima disto)
 
@@ -82,31 +82,123 @@
     }
     return true;
   }
-  // Devolve 4 cantos [sup-esq, sup-dir, inf-dir, inf-esq] em coordenadas da fonte, ou null
-  function detetarPapel(fonte) {
-    var c = reduzir(fonte, 480), w = c.width, h = c.height, g = cinzento(c), n = w * h, i;
-    var t = otsu(g), m = new Uint8Array(n), claros = 0;
-    for (i = 0; i < n; i++) if (g[i] > t) { m[i] = 1; claros++; }
-    if (claros / n > 0.92 || claros / n < 0.06) return null;            // tudo papel ou nada de papel
-    var r = Math.max(1, Math.round(Math.max(w, h) / 160));
-    m = morfo(morfo(m, w, h, r, false), w, h, r, true);                     // abertura: separa o papel de reflexos
-    var mm = maiorMancha(m, w, h);
-    if (mm.n < n * 0.12) return null;
-    var tl, tr, br, bl, sMin = 1e9, sMax = -1e9, dMin = 1e9, dMax = -1e9;
+  // Alternativa: mancha clara. Experimenta vários limiares (com e sem "sem cor") e fica com a mancha mais retangular.
+  function detetarMancha(fonte) {
+    var c = reduzir(fonte, 480), w = c.width, h = c.height, n = w * h, i;
+    var dd = c.getContext('2d').getImageData(0, 0, w, h).data, g = new Float32Array(n), sat = new Float32Array(n);
     for (i = 0; i < n; i++) {
-      if (mm.lab[i] !== mm.id) continue;
-      var x = i % w, y = (i - x) / w, s = x + y, d = x - y;
-      if (s < sMin) { sMin = s; tl = [x, y]; } if (s > sMax) { sMax = s; br = [x, y]; }
-      if (d > dMax) { dMax = d; tr = [x, y]; } if (d < dMin) { dMin = d; bl = [x, y]; }
+      var R = dd[i * 4], G = dd[i * 4 + 1], B = dd[i * 4 + 2], mx = Math.max(R, G, B), mn = Math.min(R, G, B);
+      g[i] = 0.299 * R + 0.587 * G + 0.114 * B; sat[i] = mx ? (mx - mn) / mx : 0;
     }
-    var q = [tl, tr, br, bl];
-    if (!convexo(q)) return null;
-    var a = areaQuad(q);
-    if (a < n * 0.12 || mm.n / a < 0.8) return null;                       // pouco retangular
-    if (a > n * 0.97) return null;                                          // já é só papel
+    var ord = Array.prototype.slice.call(g).sort(function (a, b) { return a - b; });
+    var lims = [otsu(g), ord[Math.floor(n * 0.6)], ord[Math.floor(n * 0.75)], ord[Math.floor(n * 0.85)]];
+    var r = Math.max(1, Math.round(Math.max(w, h) / 160)), melhor = null;
+    [true, false].forEach(function (semCor) {
+      lims.forEach(function (t) {
+        var m = new Uint8Array(n), claros = 0;
+        for (var k = 0; k < n; k++) if (g[k] > t && (!semCor || sat[k] < 0.2)) { m[k] = 1; claros++; }
+        if (claros / n > 0.95 || claros / n < 0.03) return;
+        m = morfo(morfo(m, w, h, r, false), w, h, r, true);                 // abertura: separa o papel de reflexos
+        var mm = maiorMancha(m, w, h);
+        if (mm.n < n * 0.04) return;
+        // cantos: os pontos mais extremos da mancha (sup-esq = menor x+y, inf-dir = maior x+y, etc.)
+        var tl, tr, br, bl, sMin = 1e9, sMax = -1e9, dMin = 1e9, dMax = -1e9;
+        for (var k2 = 0; k2 < n; k2++) {
+          if (mm.lab[k2] !== mm.id) continue;
+          var x = k2 % w, y = (k2 - x) / w, s1 = x + y, d1 = x - y;
+          if (s1 < sMin) { sMin = s1; tl = [x, y]; } if (s1 > sMax) { sMax = s1; br = [x + 1, y + 1]; }
+          if (d1 > dMax) { dMax = d1; tr = [x + 1, y]; } if (d1 < dMin) { dMin = d1; bl = [x, y + 1]; }
+        }
+        var q = [tl, tr, br, bl];
+        if (!convexo(q)) return;
+        var a = areaQuad(q), fill = mm.n / a;
+        if (a < n * 0.04 || a > n * 0.97 || fill < 0.8) return;
+        // papel tem texto: contraste local (Laplaciano) dentro da mancha; um tampo liso não tem
+        var tx = 0, kk = 0;
+        for (var p = w + 1; p < n - w - 1; p += 2) if (mm.lab[p] === mm.id) { tx += Math.abs(g[p - 1] + g[p + 1] + g[p - w] + g[p + w] - 4 * g[p]); kk++; }
+        tx = kk ? tx / kk : 0;
+        if (tx < 2) return;
+        var nota = Math.pow(Math.min(1, fill), 3) * Math.sqrt(a / n) * Math.min(1, tx / 6);
+        if (DEBUG) console.log('cand t=' + Math.round(t) + ' semCor=' + semCor + ' area=' + (a / n).toFixed(2) + ' fill=' + fill.toFixed(2) + ' tx=' + tx.toFixed(1) + ' nota=' + nota.toFixed(3));
+        if (!melhor || nota > melhor.nota) melhor = { nota: nota, q: q };
+      });
+    });
+    if (!melhor) return null;
     var e = (fonte.naturalWidth || fonte.videoWidth || fonte.width) / w;
-    return q.map(function (p) { return [(p[0] + 0.5) * e, (p[1] + 0.5) * e]; });
+    return melhor.q.map(function (p) { return [p[0] * e, p[1] * e]; });
   }
+
+  // Deteção principal: linhas retas (Hough) nas bordas e verificação, em cada um dos 4 lados, de que há uma borda
+  // a todo o comprimento (contraste dentro/fora, de preferência papel mais claro que o fundo). Um lado pode ser a
+  // margem da foto quando o papel sai do enquadramento. Devolve 4 cantos [sup-esq, sup-dir, inf-dir, inf-esq] ou null.
+  function blur(a,w,h){ var t=new Float32Array(a.length), o=new Float32Array(a.length), x,y;
+    for(y=0;y<h;y++) for(x=0;x<w;x++){ var s=0,k=0; for(var d=-1;d<=1;d++){ var xx=x+d; if(xx>=0&&xx<w){ s+=a[y*w+xx]; k++; } } t[y*w+x]=s/k; }
+    for(y=0;y<h;y++) for(x=0;x<w;x++){ var s2=0,k2=0; for(var d2=-1;d2<=1;d2++){ var yy=y+d2; if(yy>=0&&yy<h){ s2+=t[yy*w+x]; k2++; } } o[y*w+x]=s2/k2; }
+    return o; }
+  function detetarLinhas(fonte){
+    var c=reduzir(fonte,480), w=c.width, h=c.height, n=w*h, i, x, y;
+    var dd=c.getContext('2d').getImageData(0,0,w,h).data, f=new Float32Array(n);
+    for(i=0;i<n;i++){ var R=dd[i*4],G=dd[i*4+1],B=dd[i*4+2],mx=Math.max(R,G,B),mn=Math.min(R,G,B), g=0.299*R+0.587*G+0.114*B, s=mx?(mx-mn)/mx:0; f[i]=g*(1-1.2*s); }
+    f=blur(blur(f,w,h),w,h);
+    var gx=new Float32Array(n), gy=new Float32Array(n), mag=new Float32Array(n);
+    for(y=1;y<h-1;y++) for(x=1;x<w-1;x++){ i=y*w+x;
+      var a=f[i-w-1],b=f[i-w],cc=f[i-w+1],d=f[i-1],e=f[i+1],g2=f[i+w-1],hh=f[i+w],ii=f[i+w+1];
+      gx[i]=(cc+2*e+ii)-(a+2*d+g2); gy[i]=(g2+2*hh+ii)-(a+2*b+cc); mag[i]=Math.hypot(gx[i],gy[i]); }
+    var ord=Array.prototype.slice.call(mag).sort(function(p,q){return p-q;}), gthr=Math.max(15, ord[Math.floor(n*0.85)]);
+    var of=Array.prototype.slice.call(f).sort(function(p,q){return p-q;}), PAPEL=of[Math.floor(n*0.85)]*0.85;
+    // Hough: θ em graus 0..179 (normal), ρ = x cosθ + y sinθ
+    var NT=180, D=Math.ceil(Math.hypot(w,h)), NR=2*D+1, acc=new Float32Array(NT*NR), CO=[], SI=[];
+    for(var t=0;t<NT;t++){ CO[t]=Math.cos(t*Math.PI/180); SI[t]=Math.sin(t*Math.PI/180); }
+    for(y=1;y<h-1;y++) for(x=1;x<w-1;x++){ i=y*w+x; if(mag[i]<gthr) continue;
+      var th=Math.round(Math.atan2(gy[i],gx[i])*180/Math.PI); th=((th%180)+180)%180;
+      for(var dt=-3;dt<=3;dt++){ var tt=(th+dt+180)%180, r=Math.round(x*CO[tt]+y*SI[tt])+D; acc[tt*NR+r]+=1; } }
+    // picos com supressão de não-máximos
+    var picos=[];
+    for(t=0;t<NT;t++) for(var r2=0;r2<NR;r2++){ var v=acc[t*NR+r2]; if(v<15) continue; var ok=true;
+      for(var a1=-4;a1<=4&&ok;a1++) for(var b1=-6;b1<=6;b1++){ if(!a1&&!b1) continue; var t2=t+a1, rr=r2+b1; if(t2<0){t2+=NT; rr=2*D-rr;} if(t2>=NT){t2-=NT; rr=2*D-rr;} if(rr<0||rr>=NR) continue; var u=acc[t2*NR+rr]; if(u>v||(u===v&&(a1<0||(a1===0&&b1<0)))){ ok=false; break; } }
+      if(ok) picos.push({t:t, r:r2-D, v:v}); }
+    picos.sort(function(p,q){return q.v-p.v;});
+    var V=[], H=[];
+    picos.forEach(function(p){ var vert = (p.t<45||p.t>135); var L=vert?V:H; if(L.length<10) L.push({c:CO[p.t], s:SI[p.t], r:p.r, borda:false}); });
+    V.push({c:1,s:0,r:0.5,borda:true}, {c:1,s:0,r:w-1.5,borda:true}); H.push({c:0,s:1,r:0.5,borda:true}, {c:0,s:1,r:h-1.5,borda:true});
+    function inter(L1,L2){ var det=L1.c*L2.s-L1.s*L2.c; if(Math.abs(det)<1e-6) return null; return [(L1.r*L2.s-L1.s*L2.r)/det, (L1.c*L2.r-L1.r*L2.c)/det]; }
+    function amostra(a,px,py){ var xi=Math.round(px), yi=Math.round(py); if(xi<0||yi<0||xi>=w||yi>=h) return -1; return a[yi*w+xi]; }
+    function lado(p,q,cx,cy,borda){
+      if(borda){ var bh=0, bt=0; for(var k0=0;k0<30;k0++){ var bx,by,u0=0.06+0.88*k0/29, bx=p[0]+(q[0]-p[0])*u0, by=p[1]+(q[1]-p[1])*u0, v0=-1; for(var e1=-4;e1<=4;e1+=2) for(var e2=-4;e2<=4;e2+=2){ var vv=amostra(f,Math.min(w-1,Math.max(0,bx+e1)),Math.min(h-1,Math.max(0,by+e2))); if(vv>v0) v0=vv; } if(v0<0) continue; bt++; if(v0>=PAPEL) bh++; } return bt?0.6*bh/bt:0; }
+      var M=40, pos=0, neg=0, tot=0, dx=q[0]-p[0], dy=q[1]-p[1], L=Math.hypot(dx,dy); if(L<5) return 0;
+      var nx=dy/L, ny=-dx/L, mx2=(p[0]+q[0])/2, my2=(p[1]+q[1])/2; if(nx*(cx-mx2)+ny*(cy-my2)>0){ nx=-nx; ny=-ny; }  // normal para fora
+      for(var k=0;k<M;k++){ var u=0.06+0.88*k/(M-1), sx=p[0]+dx*u, sy=p[1]+dy*u;
+        var i3=amostra(f,sx-3*nx,sy-3*ny), i7=amostra(f,sx-7*nx,sy-7*ny), o4=amostra(f,sx+4*nx,sy+4*ny), o9=amostra(f,sx+9*nx,sy+9*ny);
+        if(i3<0||i7<0) continue; tot++;
+        if(o4<0||o9<0){ pos+=0.5; continue; }
+        foraT++; if(Math.max(o9,amostra(f,sx+14*nx,sy+14*ny))>=PAPEL) foraP++;
+        var fi=Math.min(i3,i7), fo=Math.max(o4,o9), fi2=Math.max(i3,i7), fo2=Math.min(o4,o9);
+        var gm=Math.max(amostra(mag,sx,sy),amostra(mag,sx+nx,sy+ny),amostra(mag,sx-nx,sy-ny),amostra(mag,sx+2*nx,sy+2*ny));
+        if(gm<gthr*0.5) continue;
+        if(fi-fo>5) pos++; else if(fo2-fi2>5) neg++; }
+      return tot? Math.max(pos, 0.6*neg)/tot : 0; }
+    var melhor=null, foraT=0, foraP=0;
+    for(var a2=0;a2<V.length;a2++) for(var b2=a2+1;b2<V.length;b2++) for(var c2=0;c2<H.length;c2++) for(var d2=c2+1;d2<H.length;d2++){
+      var Le=V[a2], Ld=V[b2], Lt=H[c2], Lb=H[d2];
+      var ym=h/2, xa=(Le.r-Le.s*ym)/Le.c, xb=(Ld.r-Ld.s*ym)/Ld.c; if(xa>xb){ var tmp=Le; Le=Ld; Ld=tmp; }
+      var xm=w/2, ya=(Lt.r-Lt.c*xm)/Lt.s, yb=(Lb.r-Lb.c*xm)/Lb.s; if(ya>yb){ var tmp2=Lt; Lt=Lb; Lb=tmp2; }
+      var q=[inter(Le,Lt),inter(Ld,Lt),inter(Ld,Lb),inter(Le,Lb)]; if(q.some(function(p){return !p||p[0]<-0.03*w||p[0]>1.03*w||p[1]<-0.03*h||p[1]>1.03*h;})) continue;
+      var area=0; for(var k3=0;k3<4;k3++){ var P=q[k3],Q=q[(k3+1)%4]; area+=P[0]*Q[1]-Q[0]*P[1]; } area=Math.abs(area)/2; if(area<0.05*n||area>0.995*n) continue;
+      var angOk=true; for(var k4=0;k4<4;k4++){ var A=q[(k4+3)%4],B=q[k4],C=q[(k4+1)%4], v1x=A[0]-B[0],v1y=A[1]-B[1],v2x=C[0]-B[0],v2y=C[1]-B[1], cs=(v1x*v2x+v1y*v2y)/(Math.hypot(v1x,v1y)*Math.hypot(v2x,v2y)+1e-9); if(Math.abs(cs)>0.5) angOk=false; } if(!angOk) continue;
+      var cx=(q[0][0]+q[1][0]+q[2][0]+q[3][0])/4, cy=(q[0][1]+q[1][1]+q[2][1]+q[3][1])/4;
+      foraT=0; foraP=0; var s=[lado(q[0],q[1],cx,cy,Lt.borda),lado(q[1],q[2],cx,cy,Ld.borda),lado(q[2],q[3],cx,cy,Lb.borda),lado(q[3],q[0],cx,cy,Le.borda)];
+      var nb=[Lt,Ld,Lb,Le].filter(function(L){return L.borda;}).length; if(nb>2) continue;
+      if(foraT&&foraP/foraT>0.5) continue;   // fora do quadrilátero também é papel: é uma linha de texto, não a borda
+      var mn2=Math.min.apply(null,s), md=(s[0]+s[1]+s[2]+s[3])/4; if(mn2<0.3) continue;
+      var nota=md*(0.5+0.5*mn2)*Math.pow(area/n,0.3);
+      if(!melhor||nota>melhor.nota) melhor={nota:nota,q:q,s:s};
+    }
+    if(!melhor) return null;
+    var esc=(fonte.naturalWidth||fonte.videoWidth||fonte.width)/w;
+    return melhor.q.map(function(p){ return [Math.min(w,Math.max(0,p[0]))*esc, Math.min(h,Math.max(0,p[1]))*esc]; });
+  }
+
+  function detetarPapel(fonte) { return detetarLinhas(fonte) || detetarMancha(fonte); }
 
   /* ---------- qualidade ---------- */
   function qualidade(fonte, cantos) {
@@ -279,7 +371,7 @@
         estado.modo = 'ver';
         el.innerHTML = (atual.avisos && atual.avisos.length ? '<div class="aviso">' + atual.avisos.join('<br>') + '</div>' : '') +
           '<div class="zona"><canvas></canvas></div><div class="barra">' +
-          '<button data-a="apagar">Apagar</button><button data-a="cantos">Ajustar cantos</button>' +
+          '<button data-a="apagar">Apagar</button><button data-a="rodar">Rodar \u21bb</button><button data-a="cantos">Ajustar cantos</button>' +
           '<button data-a="filtro">' + (estado.filtro ? 'Cores originais' : 'Modo documento') + '</button>' +
           '<button class="ok" data-a="ok">OK</button></div>';
         var img = new Image();
@@ -330,6 +422,10 @@
         else if (a === 'apagar') fechar('apagar');
         else if (a === 'filtro') { estado.filtro = !estado.filtro; refazer(); }
         else if (a === 'cantos') ecraCantos();
+        else if (a === 'rodar') {   // 90° no sentido do relógio: o canto inf-esq passa a ser o sup-esq
+          var W0 = item.base.width, H0 = item.base.height, q0 = estado.cantos || [[0, 0], [W0, 0], [W0, H0], [0, H0]];
+          estado.cantos = [q0[3], q0[0], q0[1], q0[2]]; refazer();
+        }
         else if (a === 'voltar') ecraVer();
         else if (a === 'sem') { estado.cantos = null; refazer(); }
         else if (a === 'aplicar') { if (convexo(estado.tmp)) { estado.cantos = estado.tmp; if (!item.cantos && estado.filtro === false) estado.filtro = true; refazer(); } }
@@ -339,7 +435,7 @@
   }
 
   window.JWScan = {
-    versao: 1, processar: processar, abrirFicheiro: abrirFicheiro, rever: rever, compactar: compactar,
+    versao: 2, processar: processar, abrirFicheiro: abrirFicheiro, rever: rever, compactar: compactar,
     detetarPapel: detetarPapel, qualidade: qualidade, endireitar: endireitar, documento: documento,
     limites: { nitidez: LIMITE_NITIDEZ, luz: LIMITE_LUZ }
   };
